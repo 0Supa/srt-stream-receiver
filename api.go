@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/0supa/srt-stream-receiver/meta"
 	"github.com/gorilla/websocket"
 )
 
@@ -36,7 +37,7 @@ func readMessage(ctx *connContext, input []byte) {
 				return
 			}
 
-			if _, found := allowedStreamIDs[streamid]; !found || ctx.Streamid == streamid {
+			if _, found := meta.AllowedStreamIDs[streamid]; !found || ctx.Streamid == streamid {
 				return
 			}
 
@@ -84,7 +85,7 @@ func handleConnection(conn *websocket.Conn) {
 
 func initAPI(httpAddr string) {
 	go func() {
-		for event := range statsChannel {
+		for event := range meta.StatsChannel {
 			res := map[string]interface{}{
 				"streamid": event.Streamid,
 				"type":     event.Type,

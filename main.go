@@ -5,14 +5,16 @@ package main
 import "C"
 
 import (
-	"bufio"
+	"errors"
+	"io"
 	"log"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/0supa/srt-stream-receiver/meta"
+	"github.com/0supa/srt-stream-receiver/webrtc"
 	"github.com/haivision/srtgo"
 )
 
@@ -44,15 +46,11 @@ type publisherConn struct {
 var listenersMap = make(map[string]map[int]*listener)
 var listenersLock sync.RWMutex
 
-var statsChannel = make(chan *publisherEvent)
-
-var allowedStreamIDs = make(map[string]bool)
-
 func listenCallback(sock *srtgo.SrtSocket, version int, addr *net.UDPAddr, streamid string) bool {
 	log.Printf("SRT socket connecting - hsVersion: %d, streamid: %s\n", version, streamid)
 
 	// socket not in allowed ids -> reject
-	if _, found := allowedStreamIDs[strings.TrimPrefix(streamid, "publish:")]; !found {
+	if _, found := meta.AllowedStreamIDs[strings.TrimPrefix(streamid, "publish:")]; !found {
 		log.Println("Rejected connection - streamid:", streamid)
 		// set custom reject reason
 		sock.SetRejectReason(srtgo.RejectionReasonUnauthorized)
@@ -120,7 +118,7 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		return
 	}
 
-	statsChannel <- &publisherEvent{Streamid: streamid, Type: "start"}
+	meta.StatsChannel <- &meta.PublisherEvent{Streamid: streamid, Type: "start"}
 
 	updateTicker := time.NewTicker(500 * time.Millisecond)
 	go func() {
@@ -130,16 +128,18 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 				log.Println(streamid, err)
 			}
 
-			statsChannel <- &publisherEvent{
+			meta.StatsChannel <- &meta.PublisherEvent{
 				Streamid: streamid,
 				Type:     "update",
 				Data:     stats,
-				Conn: publisherConn{
+				Conn: meta.PublisherConn{
 					Latency: srtLatency,
 				},
 			}
 		}
 	}()
+
+	webrtc.Startup()
 
 	buf := make([]byte, 1316) // TS_UDP_LEN
 	for {
@@ -152,6 +152,18 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		// handle EOF
 		if n == 0 {
 			break
+		}
+
+		vtrack := webrtc.VideoTrack
+		if vtrack != nil {
+			if _, err := webrtc.VideoTrack.Write(buf[:n]); err != nil {
+				if errors.Is(err, io.ErrClosedPipe) {
+					// The peerConnection has been closed.
+					return
+				}
+
+				panic(err)
+			}
 		}
 
 		listeners := listenersMap[streamid]
@@ -167,7 +179,7 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 	}
 
 	updateTicker.Stop()
-	statsChannel <- &publisherEvent{Streamid: streamid, Type: "stop"}
+	meta.StatsChannel <- &meta.PublisherEvent{Streamid: streamid, Type: "stop"}
 }
 
 func main() {
@@ -175,21 +187,6 @@ func main() {
 
 	var socketPort uint16 = 8080
 	var httpAddr string = ":8181"
-
-	readFile, err := os.Open("allowlist.txt")
-
-	if err != nil {
-		log.Panicln("Failed opening allowlist file", err)
-	}
-	fileScanner := bufio.NewScanner(readFile)
-
-	fileScanner.Split(bufio.ScanLines)
-
-	for fileScanner.Scan() {
-		allowedStreamIDs[fileScanner.Text()] = true
-	}
-
-	readFile.Close()
 
 	options := make(map[string]string)
 	options["blocking"] = "0"
@@ -200,7 +197,7 @@ func main() {
 
 	sck.SetListenCallback(listenCallback)
 
-	err = sck.Listen(5)
+	err := sck.Listen(5)
 	if err != nil {
 		log.Fatalf("Listen failed: %v \n", err.Error())
 	}
