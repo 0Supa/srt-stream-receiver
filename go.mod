@@ -5,6 +5,8 @@ go 1.23.2
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/haivision/srtgo v0.0.0-20230627061225-a70d53fcd618
+	github.com/pion/webrtc/v3 v3.3.4
+	github.com/pion/webrtc/v4 v4.0.2
 )
 
 require (
@@ -25,7 +27,6 @@ require (
 	github.com/pion/stun/v3 v3.0.0 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/turn/v4 v4.0.0 // indirect
-	github.com/pion/webrtc/v4 v4.0.2 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
 	golang.org/x/crypto v0.28.0 // indirect
 	golang.org/x/net v0.30.0 // indirect

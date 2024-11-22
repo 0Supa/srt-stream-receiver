@@ -6,9 +6,11 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,8 @@ import (
 	"github.com/0supa/srt-stream-receiver/meta"
 	"github.com/0supa/srt-stream-receiver/webrtc"
 	"github.com/haivision/srtgo"
+	"github.com/pion/webrtc/v3/pkg/media/h264reader"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 type listener struct {
@@ -141,6 +145,30 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 
 	webrtc.Startup()
 
+	rawReader := exec.Command("ffmpeg",
+		"-hide_banner",
+		"-i", "srt://127.0.0.1:8080?streamid="+streamid,
+		"-map", "0:v:0",
+		"-fflags", "nobuffer",
+		"-c:v", "copy",
+		"-f", "rawvideo", "pipe:1",
+		"-map", "0:a:0",
+		"-c:a", "libopus", "pipe:2")
+
+	videoPipe, err := rawReader.StdoutPipe()
+	if err != nil {
+		panic(fmt.Sprintf("Error creating video pipe: %v", err))
+	}
+	// audioPipe, err := rawReader.StderrPipe()
+	// if err != nil {
+	// 	panic(fmt.Sprintf("Error creating audio pipe: %v", err))
+	// }
+
+	err = rawReader.Start()
+	if err != nil {
+		panic(fmt.Sprintf("Error starting FFmpeg: %v", err))
+	}
+
 	buf := make([]byte, 1316) // TS_UDP_LEN
 	for {
 		n, err := sock.Read(buf)
@@ -152,18 +180,6 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		// handle EOF
 		if n == 0 {
 			break
-		}
-
-		vtrack := webrtc.VideoTrack
-		if vtrack != nil {
-			if _, err := webrtc.VideoTrack.Write(buf[:n]); err != nil {
-				if errors.Is(err, io.ErrClosedPipe) {
-					// The peerConnection has been closed.
-					return
-				}
-
-				panic(err)
-			}
 		}
 
 		listeners := listenersMap[streamid]
@@ -178,6 +194,40 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		}
 	}
 
+	go func() {
+		vtrack := webrtc.VideoTrack
+		reader, err := h264reader.NewReader(videoPipe)
+		if err != nil {
+			fmt.Println("h264reader error:", err)
+			return
+		}
+
+		for {
+			if vtrack != nil {
+				nal, err := reader.NextNAL()
+				if err != nil {
+					fmt.Println("h264reader error:", err)
+					return
+				}
+
+				// convert to annex b
+				nal.Data = append([]byte{0x00, 0x00, 0x00, 0x01}, nal.Data...)
+
+				if err := vtrack.WriteSample(media.Sample{
+					Data: nal.Data,
+				}); err != nil {
+					if errors.Is(err, io.ErrClosedPipe) {
+						// The peerConnection has been closed.
+						return
+					}
+
+					panic(err)
+				}
+			}
+		}
+	}()
+
+	rawReader.Wait()
 	updateTicker.Stop()
 	meta.StatsChannel <- &meta.PublisherEvent{Streamid: streamid, Type: "stop"}
 }
