@@ -5,8 +5,6 @@ package main
 import "C"
 
 import (
-	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -16,39 +14,11 @@ import (
 	"time"
 
 	"github.com/0supa/srt-stream-receiver/meta"
-	"github.com/0supa/srt-stream-receiver/webrtc"
 	"github.com/haivision/srtgo"
-	"github.com/pion/webrtc/v3/pkg/media/h264reader"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/h264reader"
+	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
-
-type listener struct {
-	Index     int
-	Socket    *srtgo.SrtSocket
-	Address   *net.UDPAddr
-	Active    bool
-	WaitGroup *sync.WaitGroup
-	Streamid  string
-}
-
-type publisher struct {
-	Stats chan *publisherEvent
-}
-
-type publisherEvent struct {
-	Streamid string
-	Type     string
-	Data     *srtgo.SrtStats
-	Conn     publisherConn
-}
-
-type publisherConn struct {
-	Latency int
-}
-
-// store listeners in a nested map with the streamid as the key
-var listenersMap = make(map[string]map[int]*listener)
-var listenersLock sync.RWMutex
 
 func listenCallback(sock *srtgo.SrtSocket, version int, addr *net.UDPAddr, streamid string) bool {
 	log.Printf("SRT socket connecting - hsVersion: %d, streamid: %s\n", version, streamid)
@@ -76,7 +46,10 @@ func handler(sock *srtgo.SrtSocket, addr *net.UDPAddr) {
 
 	if strings.HasPrefix(streamid, "publish:") {
 		streamid = strings.TrimPrefix(streamid, "publish:")
-		publish(sock, addr, streamid)
+		err := publish(sock, addr, streamid)
+		if err != nil {
+			log.Println(streamid, "publish error", err)
+		}
 	} else {
 		listen(sock, addr, streamid)
 	}
@@ -87,10 +60,14 @@ func listen(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 
 	log.Printf("%s - listen: %s\n", addr, streamid)
 
-	l := &listener{
-		Index:     int(time.Now().UnixMicro()),
-		Socket:    sock,
-		Address:   addr,
+	l := &meta.Listener{
+		Index: int(time.Now().UnixMicro()),
+		Connection: meta.Connection{
+			SRT: &meta.SrtConn{
+				Socket:  sock,
+				Address: addr,
+			},
+		},
 		Active:    true,
 		WaitGroup: &wg,
 		Streamid:  streamid,
@@ -98,29 +75,146 @@ func listen(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 
 	l.WaitGroup.Add(1)
 
-	listenersLock.Lock()
-	if listenersMap[streamid] == nil {
-		listenersMap[streamid] = make(map[int]*listener)
-	}
-	listenersMap[streamid][l.Index] = l
-	listenersLock.Unlock()
+	meta.UpdateListener(l)
 
 	l.WaitGroup.Wait()
 
-	l.Socket.Close()
-	listenersLock.Lock()
-	delete(listenersMap[streamid], l.Index)
-	listenersLock.Unlock()
+	l.Connection.SRT.Socket.Close()
+	meta.ListenersRW.Lock()
+	delete(meta.ListenersMap[streamid], l.Index)
+	meta.ListenersRW.Unlock()
 }
 
-func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
+func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) (err error) {
 	log.Printf("%s - publish: %s\n", addr, streamid)
 
 	srtLatency, err := sock.GetSockOptInt(C.SRTO_LATENCY)
 	if err != nil {
-		log.Println(streamid, err)
 		return
 	}
+
+	meta.PublishersRW.Lock()
+	publisher := meta.PublishersMap[streamid]
+	meta.PublishersRW.Unlock()
+
+	videoTrack := publisher.Tracks[0]
+	audioTrack := publisher.Tracks[1]
+
+	srtReader := exec.Command("ffmpeg",
+		"-hide_banner",
+		"-loglevel", "quiet",
+		"-i", "-",
+		"-map", "0:v:0",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		"-c:v", "copy",
+		"-f", "rawvideo", "pipe:1",
+		"-map", "0:a:0",
+		"-c:a", "libopus", "-ac", "2",
+		"-f", "opus", "pipe:2")
+
+	pipeReader, pipeWriter := io.Pipe()
+	srtReader.Stdin = pipeReader
+
+	videoPipe, err := srtReader.StdoutPipe()
+	if err != nil {
+		return
+	}
+	audioPipe, err := srtReader.StderrPipe()
+	if err != nil {
+		return
+	}
+
+	// var stderr bytes.Buffer
+	// srtReader.Stderr = &stderr
+
+	err = srtReader.Start()
+	if err != nil {
+		return
+	}
+
+	go func() {
+		reader, oggHeader, err := oggreader.NewWith(audioPipe)
+		if err != nil {
+			log.Println("oggreader error:", err)
+			return
+		}
+
+		var lastHeader *oggreader.OggPageHeader
+		for {
+			data, header, err := reader.ParseNextPage()
+			if err != nil {
+				log.Println("oggreader error:", err)
+				return
+			}
+
+			samples := header.GranulePosition
+			if lastHeader != nil {
+				samples -= lastHeader.GranulePosition
+			}
+			log.Println(samples, oggHeader.SampleRate)
+
+			lastHeader = header
+
+			err = audioTrack.WriteSample(media.Sample{
+				Data:     data,
+				Duration: time.Duration((samples/48000)*1000) * time.Millisecond,
+			})
+			if err != nil {
+				log.Println("sample error:", err)
+			}
+		}
+	}()
+
+	go func() {
+		reader, err := h264reader.NewReader(videoPipe)
+		if err != nil {
+			log.Println("h264reader error:", err)
+			return
+		}
+
+		sps := []byte{}
+		pps := []byte{}
+
+		for {
+			nal, err := reader.NextNAL()
+			if err != nil {
+				log.Println("h264reader error:", err)
+				// log.Println(stderr.String())
+				return
+			}
+
+			// convert to annex b
+			nal.Data = append([]byte{0x00, 0x00, 0x00, 0x01}, nal.Data...)
+
+			// save sps for later use
+			if nal.UnitType == 7 {
+				sps = nal.Data
+			} else if nal.UnitType == 8 { // save pps
+				pps = nal.Data
+			} else if nal.UnitType == 5 { // make stream header
+				log.Println("i-frame")
+
+				header := append(
+					sps,
+					pps...,
+				)
+
+				nal.Data = append(
+					header,
+					nal.Data...,
+				)
+			}
+
+			err = videoTrack.WriteSample(media.Sample{
+				Data: nal.Data[:],
+				// Duration: time.Second / 60,
+			})
+			if err != nil {
+				log.Println("sample error:", err)
+			}
+		}
+	}()
 
 	meta.StatsChannel <- &meta.PublisherEvent{Streamid: streamid, Type: "start"}
 
@@ -143,33 +237,8 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		}
 	}()
 
-	webrtc.Startup()
-
-	rawReader := exec.Command("ffmpeg",
-		"-hide_banner",
-		"-i", "srt://127.0.0.1:8080?streamid="+streamid,
-		"-map", "0:v:0",
-		"-fflags", "nobuffer",
-		"-c:v", "copy",
-		"-f", "rawvideo", "pipe:1",
-		"-map", "0:a:0",
-		"-c:a", "libopus", "pipe:2")
-
-	videoPipe, err := rawReader.StdoutPipe()
-	if err != nil {
-		panic(fmt.Sprintf("Error creating video pipe: %v", err))
-	}
-	// audioPipe, err := rawReader.StderrPipe()
-	// if err != nil {
-	// 	panic(fmt.Sprintf("Error creating audio pipe: %v", err))
-	// }
-
-	err = rawReader.Start()
-	if err != nil {
-		panic(fmt.Sprintf("Error starting FFmpeg: %v", err))
-	}
-
 	buf := make([]byte, 1316) // TS_UDP_LEN
+
 	for {
 		n, err := sock.Read(buf)
 		if err != nil {
@@ -182,9 +251,23 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 			break
 		}
 
-		listeners := listenersMap[streamid]
+		packet := buf[:n]
+
+		_, err = pipeWriter.Write(packet)
+		if err != nil {
+			log.Println("Error writing to FFmpeg stdin:", err)
+			break
+		}
+
+		meta.ListenersRW.Lock()
+		listeners := meta.ListenersMap[streamid]
+		meta.ListenersRW.Unlock()
 		for _, listener := range listeners {
-			_, err = listener.Socket.Write(buf[:n])
+			if listener.Connection.SRT == nil {
+				continue
+			}
+
+			_, err = listener.Connection.SRT.Socket.Write(packet)
 			if err != nil && listener.Active {
 				listener.Active = false
 				listener.WaitGroup.Done()
@@ -194,42 +277,13 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		}
 	}
 
-	go func() {
-		vtrack := webrtc.VideoTrack
-		reader, err := h264reader.NewReader(videoPipe)
-		if err != nil {
-			fmt.Println("h264reader error:", err)
-			return
-		}
-
-		for {
-			if vtrack != nil {
-				nal, err := reader.NextNAL()
-				if err != nil {
-					fmt.Println("h264reader error:", err)
-					return
-				}
-
-				// convert to annex b
-				nal.Data = append([]byte{0x00, 0x00, 0x00, 0x01}, nal.Data...)
-
-				if err := vtrack.WriteSample(media.Sample{
-					Data: nal.Data,
-				}); err != nil {
-					if errors.Is(err, io.ErrClosedPipe) {
-						// The peerConnection has been closed.
-						return
-					}
-
-					panic(err)
-				}
-			}
-		}
-	}()
-
-	rawReader.Wait()
+	pipeWriter.Close()
+	videoPipe.Close()
+	srtReader.Wait()
 	updateTicker.Stop()
 	meta.StatsChannel <- &meta.PublisherEvent{Streamid: streamid, Type: "stop"}
+
+	return
 }
 
 func main() {

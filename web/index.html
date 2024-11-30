@@ -1,0 +1,90 @@
+<div id="remoteVideos">
+    <video id="combinedMedia" autoplay playsinline></video>
+</div>
+
+<style>
+    body,
+    html {
+        margin: 0;
+        padding: 0;
+    }
+
+    video {
+        width: 100vw;
+        height: 100vh;
+    }
+</style>
+
+<script>
+    const socket = new WebSocket(`ws://localhost:8181/webrtc/websocket`)
+    let pc = new RTCPeerConnection({
+        iceServers: [
+            {
+                urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478']
+            }
+        ]
+    });
+
+    let remoteStream = new MediaStream();
+
+    socket.onmessage = e => {
+        let msg = JSON.parse(e.data)
+        if (!msg) {
+            return console.log('failed to parse msg')
+        }
+
+        switch (msg.type) {
+            case "WEBRTC_ANSWER": {
+                pc.setRemoteDescription(msg.data)
+                break
+            }
+            case "WEBRTC_CANDIDATE": {
+                pc.addIceCandidate(msg.data)
+                break
+            }
+            default: {
+                console.log("unknown msg type", msg)
+                return
+            }
+        }
+    }
+
+
+    pc.addEventListener("track", (event) => {
+        console.log(event)
+
+        remoteStream.addTrack(event.track);
+        const videoElement = document.getElementById('combinedMedia');
+        videoElement.srcObject = remoteStream;
+    })
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    pc.oniceconnectionstatechange = e => {
+        console.log(pc.iceConnectionState)
+    };
+
+    pc.onicecandidate = (e) => {
+        if (e.candidate && e.candidate.candidate !== "") {
+            socket.send(JSON.stringify({
+                type: "WEBRTC_CANDIDATE",
+                data: e.candidate
+            }))
+        }
+    };
+
+    socket.onopen = async () => {
+        socket.send(JSON.stringify({
+            type: "LISTEN",
+            data: { streamid: "local" }
+        }))
+
+        const offer = await pc.createOffer()
+        pc.setLocalDescription(offer)
+        socket.send(JSON.stringify({
+            type: "WEBRTC_OFFER",
+            data: offer
+        }))
+    }
+</script>

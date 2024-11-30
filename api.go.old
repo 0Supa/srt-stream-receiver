@@ -1,0 +1,123 @@
+	http.HandleFunc("/webrtc/session", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		streamid := r.URL.Query().Get("streamid")
+		if _, found := meta.AllowedStreamIDs[streamid]; !found {
+			http.Error(w, "invalid streamid", http.StatusUnauthorized)
+			return
+		}
+
+		peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
+			ICEServers: []webrtc.ICEServer{
+				{
+					URLs: []string{
+						"stun:stun.l.google.com:19302",
+						"stun:stun.cloudflare.com:3478",
+					},
+				},
+			},
+		})
+		if err != nil {
+			panic(err)
+		}
+
+		meta.PublishersRW.Lock()
+		publisher := meta.PublishersMap[streamid]
+		meta.PublishersRW.Unlock()
+
+		l := &meta.Listener{
+			Index: int(time.Now().UnixMicro()),
+			Connection: meta.Connection{
+				WebRTC: &meta.WebRTCConn{
+					Peer:    peerConnection,
+					Senders: []*webrtc.RTPSender{},
+				},
+			},
+			Active: true,
+			// WaitGroup: &wg,
+			Streamid: streamid,
+		}
+
+		if publisher != nil {
+			for _, track := range publisher.Tracks {
+				rtpSender, err := peerConnection.AddTrack(track)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusUnauthorized)
+					return
+				}
+				// webrtcutil.HandleSender(rtpSender)
+
+				l.Connection.WebRTC.Senders = append(l.Connection.WebRTC.Senders, rtpSender)
+			}
+		}
+
+		meta.UpdateListener(streamid, l)
+
+		// Set the handler for ICE connection state
+		// This will notify you when the peer has connected/disconnected
+		peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+			fmt.Printf("Connection State has changed %s \n", connectionState.String())
+
+			if connectionState == webrtc.ICEConnectionStateFailed {
+				if closeErr := peerConnection.Close(); closeErr != nil {
+					panic(closeErr)
+				}
+			}
+		})
+
+		peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
+			log.Println("asdadsadsadsadas")
+			if d.Label() == "stats" {
+				l = meta.GetListener(streamid, l.Index)
+				if l != nil {
+					l.Connection.WebRTC.DataChannels.Stats = d
+					meta.UpdateListener(streamid, l)
+				}
+			}
+		})
+
+		offer := webrtc.SessionDescription{}
+		if err := json.Unmarshal(body, &offer); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err = peerConnection.SetRemoteDescription(offer); err != nil {
+			panic(err)
+		}
+
+		answer, err := peerConnection.CreateAnswer(nil)
+		if err != nil {
+			panic(err)
+		}
+
+		gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
+		if err = peerConnection.SetLocalDescription(answer); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Block until ICE Gathering is complete, disabling trickle ICE
+		// we do this because we only can exchange one signaling message
+		// in a production application you should exchange ICE Candidates via OnICECandidate
+		<-gatherComplete
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(peerConnection.LocalDescription())
+	})
+
+	log.Println("HTTP listening on " + httpAddr)
+	log.Fatal(http.ListenAndServe(httpAddr, nil))
