@@ -5,54 +5,26 @@ package main
 import "C"
 
 import (
-	"bufio"
 	"log"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/0supa/srt-stream-receiver/api"
+	"github.com/0supa/srt-stream-receiver/utils"
 	"github.com/haivision/srtgo"
 )
 
-type listener struct {
-	Index     int
-	Socket    *srtgo.SrtSocket
-	Address   *net.UDPAddr
-	Active    bool
-	WaitGroup *sync.WaitGroup
-	Streamid  string
-}
-
-type publisher struct {
-	Stats chan *publisherEvent
-}
-
-type publisherEvent struct {
-	Streamid string
-	Type     string
-	Data     *srtgo.SrtStats
-	Conn     publisherConn
-}
-
-type publisherConn struct {
-	Latency int
-}
-
 // store listeners in a nested map with the streamid as the key
-var listenersMap = make(map[string]map[int]*listener)
+var listenersMap = make(map[string]map[int]*utils.Listener)
 var listenersLock sync.RWMutex
-
-var statsChannel = make(chan *publisherEvent)
-
-var allowedStreamIDs = make(map[string]bool)
 
 func listenCallback(sock *srtgo.SrtSocket, version int, addr *net.UDPAddr, streamid string) bool {
 	log.Printf("SRT socket connecting - hsVersion: %d, streamid: %s\n", version, streamid)
 
 	// socket not in allowed ids -> reject
-	if _, found := allowedStreamIDs[strings.TrimPrefix(streamid, "publish:")]; !found {
+	if _, found := utils.AllowedStreamIDs[strings.TrimPrefix(streamid, "publish:")]; !found {
 		log.Println("Rejected connection - streamid:", streamid)
 		// set custom reject reason
 		sock.SetRejectReason(srtgo.RejectionReasonUnauthorized)
@@ -85,7 +57,7 @@ func listen(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 
 	log.Printf("%s - listen: %s\n", addr, streamid)
 
-	l := &listener{
+	l := &utils.Listener{
 		Index:     int(time.Now().UnixMicro()),
 		Socket:    sock,
 		Address:   addr,
@@ -98,7 +70,7 @@ func listen(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 
 	listenersLock.Lock()
 	if listenersMap[streamid] == nil {
-		listenersMap[streamid] = make(map[int]*listener)
+		listenersMap[streamid] = make(map[int]*utils.Listener)
 	}
 	listenersMap[streamid][l.Index] = l
 	listenersLock.Unlock()
@@ -120,7 +92,7 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 		return
 	}
 
-	statsChannel <- &publisherEvent{Streamid: streamid, Type: "start"}
+	utils.StatsChannel <- &utils.PublisherEvent{Streamid: streamid, Type: "start"}
 
 	updateTicker := time.NewTicker(500 * time.Millisecond)
 	go func() {
@@ -130,11 +102,11 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 				log.Println(streamid, err)
 			}
 
-			statsChannel <- &publisherEvent{
+			utils.StatsChannel <- &utils.PublisherEvent{
 				Streamid: streamid,
 				Type:     "update",
 				Data:     stats,
-				Conn: publisherConn{
+				Conn: utils.PublisherConn{
 					Latency: srtLatency,
 				},
 			}
@@ -154,6 +126,7 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 			break
 		}
 
+		listenersLock.Lock()
 		listeners := listenersMap[streamid]
 		for _, listener := range listeners {
 			_, err = listener.Socket.Write(buf[:n])
@@ -164,10 +137,11 @@ func publish(sock *srtgo.SrtSocket, addr *net.UDPAddr, streamid string) {
 				log.Println(listener.Streamid, err)
 			}
 		}
+		listenersLock.Unlock()
 	}
 
 	updateTicker.Stop()
-	statsChannel <- &publisherEvent{Streamid: streamid, Type: "stop"}
+	utils.StatsChannel <- &utils.PublisherEvent{Streamid: streamid, Type: "stop"}
 }
 
 func main() {
@@ -175,21 +149,6 @@ func main() {
 
 	var socketPort uint16 = 8080
 	var httpAddr string = ":8181"
-
-	readFile, err := os.Open("allowlist.txt")
-
-	if err != nil {
-		log.Panicln("Failed opening allowlist file", err)
-	}
-	fileScanner := bufio.NewScanner(readFile)
-
-	fileScanner.Split(bufio.ScanLines)
-
-	for fileScanner.Scan() {
-		allowedStreamIDs[fileScanner.Text()] = true
-	}
-
-	readFile.Close()
 
 	options := make(map[string]string)
 	options["blocking"] = "0"
@@ -200,13 +159,13 @@ func main() {
 
 	sck.SetListenCallback(listenCallback)
 
-	err = sck.Listen(5)
+	err := sck.Listen(5)
 	if err != nil {
 		log.Fatalf("Listen failed: %v \n", err.Error())
 	}
 	log.Println("SRT Socket listening on port", socketPort)
 
-	go initAPI(httpAddr)
+	go api.InitAPI(httpAddr)
 
 	wg.Add(1)
 
